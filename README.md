@@ -41,12 +41,16 @@ npx -y github:blueqwertz/beck-mcp
 
 ---
 
-## Integrating with Claude Desktop
+## Integrating with AI Agents
 
-To use this server with Claude Desktop, add it to your `claude_desktop_config.json` configuration file:
+To use this server with your favorite AI agents, follow the configuration steps below. Select your agent to view the setup instructions.
 
-### On macOS
-Location: `~/Library/Application Support/Claude/claude_desktop_config.json`
+<details>
+<summary><b>Claude Desktop</b></summary>
+
+### Configuration Location
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
 Add the following configuration block:
 
@@ -69,6 +73,144 @@ Add the following configuration block:
 ```
 
 Replace `YOUR_BECK_USERNAME` and `YOUR_BECK_PASSWORD` with your actual Beck-Online credentials. Restart Claude Desktop after making these changes.
+</details>
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+### CLI Method (Recommended)
+You can add the MCP server directly by running:
+```bash
+claude mcp add --env BECK_USERNAME="YOUR_BECK_USERNAME" --env BECK_PASSWORD="YOUR_BECK_PASSWORD" beck-mcp -- npx -y github:blueqwertz/beck-mcp
+```
+
+### Manual Configuration
+Alternatively, edit your global configuration file `~/.claude.json` to include:
+```json
+{
+  "mcpServers": {
+    "beck-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "github:blueqwertz/beck-mcp"
+      ],
+      "env": {
+        "BECK_USERNAME": "YOUR_BECK_USERNAME",
+        "BECK_PASSWORD": "YOUR_BECK_PASSWORD"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cursor</b></summary>
+
+### UI Method
+1. Open Cursor Settings and navigate to **Features** -> **MCP**.
+2. Click **+ Add New MCP Server**.
+3. Configure the fields:
+   - **Name**: `beck-mcp`
+   - **Type**: `stdio`
+   - **Command**: `npx -y github:blueqwertz/beck-mcp`
+4. Since Cursor's UI does not directly allow specifying environment variables for this command type, it is recommended to run Cursor from a terminal session where `BECK_USERNAME` and `BECK_PASSWORD` are exported, or use the configuration file method below.
+
+### Configuration File Method
+Edit your project-level `.cursor/mcp.json` or global `~/.cursor/mcp.json` file to include:
+```json
+{
+  "mcpServers": {
+    "beck-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "github:blueqwertz/beck-mcp"
+      ],
+      "env": {
+        "BECK_USERNAME": "YOUR_BECK_USERNAME",
+        "BECK_PASSWORD": "YOUR_BECK_PASSWORD"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Antigravity</b></summary>
+
+### Configuration File Method
+1. Open the Agent Panel in your IDE.
+2. Click the **"..."** menu at the top of the panel and select **Manage MCP Servers**.
+3. Click **View raw config** to open `mcp_config.json` (typically located at `~/.gemini/antigravity-cli/mcp_config.json` or `.agents/mcp_config.json`).
+4. Add the following to the `mcpServers` object:
+```json
+{
+  "mcpServers": {
+    "beck-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "github:blueqwertz/beck-mcp"
+      ],
+      "env": {
+        "BECK_USERNAME": "YOUR_BECK_USERNAME",
+        "BECK_PASSWORD": "YOUR_BECK_PASSWORD"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Codex</b></summary>
+
+### CLI Method
+You can add the MCP server by running:
+```bash
+codex mcp add beck-mcp --env BECK_USERNAME="YOUR_BECK_USERNAME" --env BECK_PASSWORD="YOUR_BECK_PASSWORD" -- npx -y github:blueqwertz/beck-mcp
+```
+
+### Manual Configuration
+Or edit your `config.toml` (located at `~/.codex/config.toml` globally or `.codex/config.toml` in your project root) and add:
+```toml
+[mcp_servers.beck-mcp]
+command = "npx"
+args = ["-y", "github:blueqwertz/beck-mcp"]
+env = { BECK_USERNAME = "YOUR_BECK_USERNAME", BECK_PASSWORD = "YOUR_BECK_PASSWORD" }
+```
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+### CLI Method
+Add the server interactively by running:
+```bash
+opencode mcp add
+```
+
+### Manual Configuration
+Or edit your project configuration file (e.g. `opencode.json` or `opencode.jsonc`) to include:
+```json
+{
+  "mcp": {
+    "beck-mcp": {
+      "type": "local",
+      "command": ["npx", "-y", "github:blueqwertz/beck-mcp"],
+      "enabled": true,
+      "environment": {
+        "BECK_USERNAME": "YOUR_BECK_USERNAME",
+        "BECK_PASSWORD": "YOUR_BECK_PASSWORD"
+      }
+    }
+  }
+}
+```
+</details>
 
 ---
 
