@@ -1,40 +1,122 @@
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import { Browser, Page } from 'puppeteer';
+import { URL } from 'url';
+import * as cheerio from 'cheerio';
+import PDFDocument from 'pdfkit';
+import * as fs from 'fs';
 import { SearchResult, DocumentContent } from './types';
 
-// Use the stealth plugin to avoid fingerprint/bot blocks
-puppeteer.use(StealthPlugin());
+export class CookieJar {
+  private cookies: Map<string, Map<string, string>> = new Map(); // domain -> (name -> value)
+
+  setCookie(cookieStr: string, requestUrl: string) {
+    const url = new URL(requestUrl);
+    const parts = cookieStr.split(';').map(p => p.trim());
+    if (parts.length === 0) return;
+
+    const [nameValue] = parts;
+    const eqIdx = nameValue.indexOf('=');
+    if (eqIdx === -1) return;
+
+    const name = nameValue.substring(0, eqIdx);
+    const value = nameValue.substring(eqIdx + 1);
+
+    // Determine domain, default to current host
+    let domain = url.hostname;
+    for (const part of parts) {
+      if (part.toLowerCase().startsWith('domain=')) {
+        domain = part.substring('domain='.length).trim();
+        if (domain.startsWith('.')) {
+          domain = domain.substring(1);
+        }
+      }
+    }
+
+    if (!this.cookies.has(domain)) {
+      this.cookies.set(domain, new Map());
+    }
+    this.cookies.get(domain)!.set(name, value);
+  }
+
+  getCookieHeader(requestUrl: string): string {
+    const url = new URL(requestUrl);
+    const host = url.hostname;
+    const matchedCookies: string[] = [];
+
+    for (const [domain, cookieMap] of this.cookies.entries()) {
+      if (host === domain || host.endsWith('.' + domain)) {
+        for (const [name, value] of cookieMap.entries()) {
+          matchedCookies.push(`${name}=${value}`);
+        }
+      }
+    }
+
+    return matchedCookies.join('; ');
+  }
+}
+
+export class HttpClient {
+  private jar = new CookieJar();
+  private userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+  async request(url: string, options: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(options.headers || {});
+    
+    const cookieHeader = this.jar.getCookieHeader(url);
+    if (cookieHeader) {
+      headers.set('Cookie', cookieHeader);
+    }
+    
+    if (!headers.has('User-Agent')) {
+      headers.set('User-Agent', this.userAgent);
+    }
+
+    const res = await fetch(url, {
+      ...options,
+      headers,
+      redirect: 'manual'
+    });
+
+    // Capture cookies
+    const setCookieHeaders = res.headers.getSetCookie 
+      ? res.headers.getSetCookie() 
+      : (res.headers.get('set-cookie')?.split(',').map(s => s.trim()) || []);
+      
+    for (const cookieStr of setCookieHeaders) {
+      this.jar.setCookie(cookieStr, url);
+    }
+
+    // Handle redirects manually
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      if (location) {
+        const nextUrl = new URL(location, url).toString();
+        console.error(`HTTP Client: Following redirect to ${nextUrl}`);
+        
+        // Form post redirects are usually followed as GET requests
+        return this.request(nextUrl, {
+          method: 'GET',
+          headers: {
+            'Referer': url
+          }
+        });
+      }
+    }
+
+    return res;
+  }
+}
 
 export class BeckClient {
-  private browser: Browser | null = null;
-  private page: Page | null = null;
+  private client: HttpClient;
   private username?: string;
   private password?: string;
 
   constructor(username?: string, password?: string) {
+    this.client = new HttpClient();
     this.username = username;
     this.password = password;
   }
 
-  /**
-   * Initializes the browser and page. If credentials are set, performs login.
-   */
   async initialize(): Promise<void> {
-    console.error('Launching browser...');
-    this.browser = await (puppeteer as any).launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--window-size=1280,800'
-      ]
-    }) as Browser;
-
-    this.page = await this.browser.newPage();
-    await this.page.setViewport({ width: 1280, height: 800 });
-
     if (this.username && this.password) {
       await this.login();
     } else {
@@ -42,300 +124,237 @@ export class BeckClient {
     }
   }
 
-  /**
-   * Performs the login flow via account.beck.de.
-   */
   async login(): Promise<void> {
-    if (!this.page) throw new Error('Client not initialized. Call initialize() first.');
     if (!this.username || !this.password) {
       throw new Error('Username and Password must be set to log in.');
     }
 
-    console.error(`Navigating to beck-online to start login...`);
-    await this.page.goto('https://beck-online.beck.de', { waitUntil: 'networkidle2' });
+    console.error('Starting login redirect chain...');
+    const startUrl = 'https://beck-online.beck.de/Konto/IdentityProviderLogin?referrer=Model.Referer.ReferrerUrl';
+    const response = await this.client.request(startUrl);
 
-    // Check if we are redirected to the login page
-    const currentUrl = this.page.url();
-    if (!currentUrl.includes('account.beck.de/Login')) {
-      // We might already be logged in if there was session state, but we started fresh.
-      // Just in case, check if we need to click a login button
-      const loginButton = await this.page.$('a[href*="IdentityProviderLogin"]');
-      if (loginButton) {
-        console.error('Clicking identity provider login button...');
-        await Promise.all([
-          this.page.waitForNavigation({ waitUntil: 'networkidle2' }),
-          loginButton.click()
-        ]);
-      }
-    }
-
-    // Now we should be on account.beck.de/Login
-    if (this.page.url().includes('account.beck.de/Login')) {
-      console.error('Login page reached. Filling credentials...');
+    const loginPageHtml = await response.text();
+    
+    // Parse anti-forgery token from HTML
+    const tokenMatch = loginPageHtml.match(/name="__RequestVerificationToken"\s+type="hidden"\s+value="([^"]+)"/i)
+      || loginPageHtml.match(/value="([^"]+)"\s+name="__RequestVerificationToken"/i);
       
-      // Wait for input fields
-      await this.page.waitForSelector('input[name="Input.Username"]', { timeout: 10000 });
-      await this.page.waitForSelector('input[name="Input.Password"]', { timeout: 10000 });
-
-      // Type username and password
-      await this.page.type('input[name="Input.Username"]', this.username);
-      await this.page.type('input[name="Input.Password"]', this.password);
-
-      console.error('Submitting credentials...');
-      // Pressing enter triggers submission. Wait for redirect back to beck-online.beck.de
-      await Promise.all([
-        this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-        this.page.keyboard.press('Enter')
-      ]);
+    if (!tokenMatch) {
+      // Check if we are already logged in (redirected directly to home page)
+      if (response.url.includes('beck-online.beck.de') && !response.url.includes('account.beck.de/Login')) {
+        console.error('Already logged in or bypassed login page.');
+        return;
+      }
+      throw new Error('Failed to find __RequestVerificationToken on the login page.');
     }
 
-    // Check if login was successful
-    const finalUrl = this.page.url();
+    const token = tokenMatch[1];
+    console.error('Extracted __RequestVerificationToken. Submitting credentials...');
+
+    // Build Form POST body
+    const params = new URLSearchParams();
+    params.append('Input.Username', this.username);
+    params.append('Input.Password', this.password);
+    params.append('Input.RememberMe', 'true');
+    params.append('__RequestVerificationToken', token);
+    params.append('Input.RememberMe', 'false');
+
+    const loginRes = await this.client.request(response.url, {
+      method: 'POST',
+      body: params,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const finalUrl = loginRes.url;
     if (finalUrl.includes('account.beck.de/Login')) {
-      // Check for validation errors
-      const errorText = await this.page.evaluate(() => {
-        const errEl = document.querySelector('.text-danger, .validation-summary-errors, .alert-danger');
-        return errEl ? errEl.textContent?.trim() : null;
-      });
-      throw new Error(`Login failed: ${errorText || 'Still on login page after submission.'}`);
+      const $ = cheerio.load(await loginRes.text());
+      const errorText = $('.text-danger, .validation-summary-errors, .alert-danger').text().trim();
+      throw new Error(`Login failed: ${errorText || 'Invalid credentials or validation error'}`);
     }
 
-    console.error('Login successful. Current URL:', this.page.url());
+    console.error('Login successful. Landed on:', finalUrl);
   }
 
-  /**
-   * Searches beck-online for the given query.
-   */
   async search(query: string, pageNum: number = 1): Promise<SearchResult[]> {
-    if (!this.page) throw new Error('Client not initialized.');
-    
     console.error(`Searching for "${query}" (Page ${pageNum})...`);
     const searchUrl = `https://beck-online.beck.de/Search?words=${encodeURIComponent(query)}&pagenr=${pageNum}`;
-    await this.page.goto(searchUrl, { waitUntil: 'networkidle2' });
+    const res = await this.client.request(searchUrl);
+    const html = await res.text();
+    const $ = cheerio.load(html);
 
-    // Extract search result links
-    const results = await this.page.evaluate(() => {
-      const links = document.querySelectorAll('a[href*="vpath="], a[href*="vpath%3D"]');
-      const seenVpaths = new Set<string>();
-      const items: any[] = [];
+    const results: SearchResult[] = [];
+    const seenVpaths = new Set<string>();
 
-      links.forEach(link => {
-        const href = link.getAttribute('href') || '';
-        try {
-          // Parse vpath from href
-          let vpath = '';
-          if (href.includes('vpath=')) {
-            const match = href.match(/[?&]vpath=([^&]+)/);
-            if (match) vpath = decodeURIComponent(match[1]);
-          } else if (href.includes('vpath%3D')) {
-            const match = href.match(/vpath%3D([^&]+)/);
-            if (match) vpath = decodeURIComponent(match[1]);
-          }
+    $('a').each((_, el) => {
+      const $link = $(el);
+      const href = $link.attr('href') || '';
+      if (!href.includes('vpath=') && !href.includes('vpath%3D')) return;
 
-          if (!vpath || seenVpaths.has(vpath)) return;
-          seenVpaths.add(vpath);
-
-          const title = link.textContent?.trim() || 'Untitled Document';
-          
-          // Traverse up to find parent element containing text snippet
-          let parent = link.parentElement;
-          let snippet = '';
-          for (let i = 0; i < 3; i++) {
-            if (parent && (parent.classList.contains('hit') || parent.classList.contains('treffer') || parent.tagName === 'LI' || parent.tagName === 'DIV')) {
-              snippet = parent.textContent?.replace(title, '').trim() || '';
-              snippet = snippet.replace(/\s+/g, ' ').substring(0, 300);
-              break;
-            }
-            parent = parent?.parentElement || null;
-          }
-
-          items.push({
-            title,
-            snippet,
-            vpath,
-            url: `https://beck-online.beck.de/?vpath=${encodeURIComponent(vpath)}`
-          });
-        } catch (e) {
-          // Ignore parse errors
-        }
-      });
-
-      return items;
-    });
-
-    return results as SearchResult[];
-  }
-
-  /**
-   * Retrieves a document by its vpath and parses its content into Markdown.
-   */
-  async getDocument(vpath: string): Promise<DocumentContent> {
-    if (!this.page) throw new Error('Client not initialized.');
-
-    console.error(`Fetching document: ${vpath}...`);
-    const docUrl = `https://beck-online.beck.de/?vpath=${encodeURIComponent(vpath)}`;
-    await this.page.goto(docUrl, { waitUntil: 'networkidle2' });
-
-    // Wait for the main document container
-    await this.page.waitForSelector('#dokcontent', { timeout: 10000 }).catch(() => {
-      throw new Error('Document content container (#dokcontent) not found on page. The vpath might be invalid or access is restricted.');
-    });
-
-    const parsedDoc = await this.page.evaluate((vpathParam) => {
-      const docDiv = document.querySelector('#dokcontent');
-      if (!docDiv) return null;
-
-      // Clone the node so we can safely prune it
-      const clone = docDiv.cloneNode(true) as HTMLElement;
-
-      // Remove non-content boilerplates
-      const removals = clone.querySelectorAll('.breadcrumb, .dk2, .document-voting-icons, .comment, .unsichtbar, script, style, iframe');
-      removals.forEach(el => el.remove());
-
-      // Get document title
-      const titleEl = clone.querySelector('h1, h2, h3, .ueber, .title');
-      const title = titleEl?.textContent?.trim() || 'Untitled Document';
-
-      // Get citation/citation string
-      const citationEl = clone.querySelector('.citation, .zitierung, .zit');
-      const citation = citationEl?.textContent?.trim() || undefined;
-
-      // Custom tree walker to transform HTML elements into Markdown
-      let markdown = '';
-      const walker = document.createTreeWalker(clone, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-      let currentNode = walker.nextNode();
-
-      while (currentNode) {
-        if (currentNode.nodeType === Node.TEXT_NODE) {
-          const text = currentNode.textContent?.trim();
-          if (text) {
-            // Replace multiple spaces with a single space
-            markdown += text.replace(/\s+/g, ' ') + ' ';
-          }
-        } else if (currentNode.nodeType === Node.ELEMENT_NODE) {
-          const el = currentNode as HTMLElement;
-          const tagName = el.tagName.toLowerCase();
-
-          // Check if it's a heading element
-          if (tagName === 'h1' || tagName === 'h2' || tagName === 'h3' || tagName === 'h4' || tagName === 'h5' || tagName === 'h6' || el.classList.contains('ueber')) {
-            const level = tagName.startsWith('h') ? parseInt(tagName[1]) : 2;
-            markdown += `\n\n${'#'.repeat(level)} ${el.textContent?.trim()}\n\n`;
-            
-            // Skip walking children of the heading since we already added its text
-            walker.nextSibling();
-            currentNode = walker.currentNode;
-            continue;
-          }
-
-          // Check for Randnummer (marginal numbers)
-          if (el.classList.contains('randnr') || el.classList.contains('rn') || (tagName === 'em' && el.classList.contains('randnr'))) {
-            markdown += `\n\n**Rn. ${el.textContent?.trim()}** `;
-            walker.nextSibling();
-            currentNode = walker.currentNode;
-            continue;
-          }
-
-          // Paragraph breaks
-          if (tagName === 'p' || (tagName === 'div' && (el.classList.contains('text') || el.classList.contains('margoutside')))) {
-            markdown += '\n\n';
-          }
-
-          // Line breaks
-          if (tagName === 'br') {
-            markdown += '\n';
-          }
-
-          // List items
-          if (tagName === 'li') {
-            markdown += '\n- ';
-          }
-        }
-        currentNode = walker.nextNode();
+      let vpath = '';
+      const match = href.match(/[?&]vpath=([^&]+)/) || href.match(/vpath%3D([^&]+)/);
+      if (match) {
+        vpath = decodeURIComponent(match[1]);
       }
 
-      // Format clean spacing
-      markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+      if (!vpath || seenVpaths.has(vpath)) return;
+      seenVpaths.add(vpath);
 
-      return {
+      const title = $link.text().trim() || 'Untitled Document';
+      
+      // Attempt to extract snippet from parent container
+      let parent = $link.parent();
+      let snippet = '';
+      for (let i = 0; i < 3; i++) {
+        if (parent.length > 0 && (parent.hasClass('hit') || parent.hasClass('treffer') || parent.hasClass('bo-treffer') || parent.prop('tagName') === 'LI' || parent.prop('tagName') === 'DIV')) {
+          snippet = parent.text().replace(title, '').trim();
+          snippet = snippet.replace(/\s+/g, ' ').substring(0, 300);
+          break;
+        }
+        parent = parent.parent();
+      }
+
+      results.push({
         title,
-        citation,
-        markdownContent: markdown,
-        vpath: vpathParam
-      };
-    }, vpath);
-
-    if (!parsedDoc) {
-      throw new Error('Failed to parse document content.');
-    }
-
-    return parsedDoc;
-  }
-
-  /**
-   * Generates a PDF of the document page and saves it to a specified local path.
-   */
-  async downloadPdf(vpath: string, outputPath: string): Promise<string> {
-    if (!this.page) throw new Error('Client not initialized.');
-
-    console.error(`Fetching document for PDF export: ${vpath}...`);
-    const docUrl = `https://beck-online.beck.de/?vpath=${encodeURIComponent(vpath)}`;
-    await this.page.goto(docUrl, { waitUntil: 'networkidle2' });
-
-    // Wait for content container
-    await this.page.waitForSelector('#dokcontent', { timeout: 10000 }).catch(() => {
-      throw new Error('Document content container (#dokcontent) not found on page.');
+        snippet,
+        vpath,
+        url: `https://beck-online.beck.de/?vpath=${encodeURIComponent(vpath)}`
+      });
     });
 
-    console.error(`Emulating print media and generating PDF...`);
-    // Emulate screen/print media and apply custom styling to clean up margins
-    await this.page.emulateMediaType('print');
-    
-    // Add print styles to hide headers/sidebars in the print output
-    await this.page.addStyleTag({
-      content: `
-        @media print {
-          /* Hide headers, toolbars, sidebars, cookies, and other non-document content */
-          body > *:not(#bo_center), 
-          #bo_center > *:not(#dokcontent),
-          .breadcrumb, .dk2, .document-voting-icons, .comment, .unsichtbar,
-          #HeaderControl, #SearchFormControl, #aktenAuswahl, .anmerkungicon {
-            display: none !important;
+    return results;
+  }
+
+  async getDocument(vpath: string): Promise<DocumentContent> {
+    console.error(`Fetching document: ${vpath}...`);
+    const docUrl = `https://beck-online.beck.de/?vpath=${encodeURIComponent(vpath)}`;
+    const res = await this.client.request(docUrl);
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    const dokcontent = $('#dokcontent');
+    if (dokcontent.length === 0) {
+      throw new Error('Document content container (#dokcontent) not found on page. The vpath might be invalid or access is restricted.');
+    }
+
+    // Remove unwanted elements
+    dokcontent.find('.breadcrumb, .dk2, .document-voting-icons, .comment, .unsichtbar, script, style, iframe').remove();
+
+    const title = dokcontent.find('h1, h2, h3, .ueber, .title').first().text().trim() || 'Untitled Document';
+    const citation = dokcontent.find('.citation, .zitierung, .zit').first().text().trim() || undefined;
+
+    const blocks: string[] = [];
+    dokcontent.find('h1, h2, h3, h4, h5, h6, .ueber, p, div.text, div.margoutside, li').each((_, el) => {
+      const $el = $(el);
+      const tagName = el.tagName.toLowerCase();
+
+      if ($el.parents('p, div.text, div.margoutside, li').length > 0) {
+        return;
+      }
+
+      const text = $el.text().trim();
+      if (!text) return;
+
+      if (tagName.startsWith('h') || $el.hasClass('ueber')) {
+        const level = tagName.startsWith('h') ? parseInt(tagName[1]) : 2;
+        blocks.push(`\n\n${'#'.repeat(level)} ${text}\n\n`);
+      } else if (tagName === 'li') {
+        blocks.push(`\n- ${text}`);
+      } else {
+        const randnrEl = $el.find('.randnr, .rn');
+        if (randnrEl.length > 0) {
+          const rnText = randnrEl.first().text().trim();
+          let cleanText = text;
+          if (cleanText.startsWith(rnText)) {
+            cleanText = cleanText.substring(rnText.length).trim();
           }
-          #dokcontent {
-            width: 100% !important;
-            margin: 0 !important;
-            padding: 0 !important;
+          blocks.push(`\n\n**Rn. ${rnText}** ${cleanText}`);
+        } else {
+          blocks.push(`\n\n${text}`);
+        }
+      }
+    });
+
+    const markdown = blocks.join('').replace(/\n{3,}/g, '\n\n').trim();
+
+    return {
+      title,
+      citation,
+      markdownContent: markdown,
+      vpath
+    };
+  }
+
+  async downloadPdf(vpath: string, outputPath: string): Promise<string> {
+    const docInfo = await this.getDocument(vpath);
+
+    return new Promise<string>((resolve, reject) => {
+      try {
+        const doc = new PDFDocument({ margin: 50 });
+        const stream = fs.createWriteStream(outputPath);
+        doc.pipe(stream);
+
+        // Title
+        doc.font('Helvetica-Bold').fontSize(20).text(docInfo.title, { align: 'center' });
+        doc.moveDown();
+
+        // Citation
+        if (docInfo.citation) {
+          doc.font('Helvetica-Oblique').fontSize(12).text(docInfo.citation, { align: 'center' });
+          doc.moveDown();
+        }
+
+        // Separator
+        doc.moveTo(50, doc.y).lineTo(562, doc.y).strokeColor('#cccccc').stroke();
+        doc.moveDown(2);
+
+        // Content body
+        const paragraphs = docInfo.markdownContent.split('\n\n');
+        for (const p of paragraphs) {
+          const trimmed = p.trim();
+          if (!trimmed) continue;
+
+          if (trimmed.startsWith('#')) {
+            const match = trimmed.match(/^(#+)\s+(.*)/);
+            if (match) {
+              const level = match[1].length;
+              const text = match[2];
+              doc.font('Helvetica-Bold').fontSize(18 - level * 2).text(text);
+              doc.moveDown(0.5);
+            }
+          } else if (trimmed.startsWith('**Rn.')) {
+            const match = trimmed.match(/^\*\*Rn\.\s+([^\*]+)\*\*(.*)/);
+            if (match) {
+              const rn = match[1];
+              const rest = match[2].trim();
+              doc.font('Helvetica-Bold').fontSize(10).text(`Rn. ${rn} `, { continued: true })
+                 .font('Helvetica').fontSize(10).text(rest);
+              doc.moveDown();
+            } else {
+              doc.font('Helvetica').fontSize(10).text(trimmed);
+              doc.moveDown();
+            }
+          } else if (trimmed.startsWith('-')) {
+            doc.font('Helvetica').fontSize(10).text(trimmed);
+            doc.moveDown(0.5);
+          } else {
+            doc.font('Helvetica').fontSize(10).text(trimmed);
+            doc.moveDown();
           }
         }
-      `
-    });
 
-    // Save as PDF
-    await this.page.pdf({
-      path: outputPath,
-      format: 'A4',
-      margin: {
-        top: '20mm',
-        right: '20mm',
-        bottom: '20mm',
-        left: '20mm'
-      },
-      printBackground: true
+        doc.end();
+        stream.on('finish', () => resolve(outputPath));
+        stream.on('error', (err) => reject(err));
+      } catch (err) {
+        reject(err);
+      }
     });
-
-    console.error(`PDF saved successfully to: ${outputPath}`);
-    return outputPath;
   }
 
-  /**
-   * Closes the Puppeteer browser instance.
-   */
   async close(): Promise<void> {
-    if (this.browser) {
-      console.error('Closing browser...');
-      await this.browser.close();
-      this.browser = null;
-      this.page = null;
-    }
+    // No-op since we don't have a Puppeteer browser to close
+    console.error('HttpClient session finished.');
   }
 }
