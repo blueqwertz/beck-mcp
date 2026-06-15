@@ -1,0 +1,40 @@
+{
+  "name": "@blueqwertz/beck-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for searching and retrieving documents from beck-online",
+  "main": "dist/index.js",
+  "bin": {
+    "beck-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "tsc",
+    "prepare": "npm run clean && npm run build",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "beck-online",
+    "puppeteer"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "puppeteer": "^22.12.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "rimraf": "^5.0.7",
+    "typescript": "^5.5.2"
+  }
+}
