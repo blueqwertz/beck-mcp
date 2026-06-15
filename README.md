@@ -1,12 +1,12 @@
 # Beck-Online MCP Server
 
-An MCP (Model Context Protocol) server that allows AI models to search, fetch, and export documents from **beck-online.beck.de**. It uses headless browser automation (Puppeteer with stealth configurations) to bypass anti-bot fingerprinting and interact with beck-online.
+An MCP (Model Context Protocol) server that allows AI models to search, fetch, and export documents from **beck-online.beck.de**. It uses a lightweight, pure Node.js HTTP client to manage cookies and credentials, Cheerio to parse HTML documents, and PDFKit to generate PDFs, avoiding any heavy Chromium browser dependencies or Puppeteer runtime errors.
 
 ## Features
 
 - **Search**: Query beck-online for articles, comments, laws, or other legal publications.
 - **Get Document**: Fetch the content of any document by its virtual path (`vpath`) and parse it into clean, readable Markdown.
-- **Download PDF**: Print document pages to PDF files and save them to a specified local directory.
+- **Download PDF**: Convert document text into a formatted PDF file and save it to a specified local directory.
 
 ---
 
