@@ -66,7 +66,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: 'search',
-        description: 'Search beck-online for articles, comments, laws, or other legal documents.',
+        description: 'Search beck-online for articles, comments, laws, or other legal documents. Supports optional detailed search filters.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -77,6 +77,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             page: {
               type: 'number',
               description: 'Page number of search results to retrieve (default: 1)',
+            },
+            caselaw: {
+              type: 'boolean',
+              description: 'Filter to case law (Rechtsprechung) only',
+            },
+            pendingProceedings: {
+              type: 'boolean',
+              description: 'Filter to pending proceedings (Anhängige Verfahren) only',
+            },
+            dateRange: {
+              type: 'string',
+              description: 'Date range filter in format "DD.MM.YYYY - DD.MM.YYYY" (e.g. "01.01.2024 - 31.12.2024")',
+            },
+            norm: {
+              type: 'string',
+              description: 'Limit search to documents referencing this norm/statute abbreviation (e.g. "BGB", "DSGVO", "StGB")',
+            },
+            court: {
+              type: 'string',
+              description: 'Limit case law to this court abbreviation (e.g. "BGH", "BVerwG", "BAG")',
+            },
+            journal: {
+              type: 'string',
+              description: 'Limit search to publications in this journal abbreviation (e.g. "NJW", "NVwZ", "AZR")',
             },
           },
           required: ['query'],
@@ -128,12 +152,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'search') {
       const query = String(args?.query || '');
       const page = Number(args?.page || 1);
-      
+
       if (!query) {
         throw new McpError(ErrorCode.InvalidParams, 'Search query cannot be empty.');
       }
 
-      const results = await beckClient.search(query, page);
+      const searchOptions: Record<string, unknown> = {};
+      if (args?.caselaw !== undefined) searchOptions.caselaw = Boolean(args.caselaw);
+      if (args?.pendingProceedings !== undefined) searchOptions.pendingProceedings = Boolean(args.pendingProceedings);
+      if (args?.dateRange) searchOptions.dateRange = String(args.dateRange);
+      if (args?.norm) searchOptions.norm = String(args.norm);
+      if (args?.court) searchOptions.court = String(args.court);
+      if (args?.journal) searchOptions.journal = String(args.journal);
+
+      const results = await beckClient.search(query, page, searchOptions as any);
       return {
         content: [
           {

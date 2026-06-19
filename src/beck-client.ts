@@ -2,7 +2,7 @@ import { URL } from 'url';
 import * as cheerio from 'cheerio';
 import PDFDocument from 'pdfkit';
 import * as fs from 'fs';
-import { SearchResult, DocumentContent } from './types';
+import { SearchResult, SearchOptions, DocumentContent } from './types';
 
 export class CookieJar {
   private cookies: Map<string, Map<string, string>> = new Map(); // domain -> (name -> value)
@@ -177,9 +177,29 @@ export class BeckClient {
     console.error('Login successful. Landed on:', finalUrl);
   }
 
-  async search(query: string, pageNum: number = 1): Promise<SearchResult[]> {
+  async search(query: string, pageNum: number = 1, options: SearchOptions = {}): Promise<SearchResult[]> {
     console.error(`Searching for "${query}" (Page ${pageNum})...`);
-    const searchUrl = `https://beck-online.beck.de/Search?words=${encodeURIComponent(query)}&pagenr=${pageNum}`;
+
+    const params = new URLSearchParams();
+    params.set('pagenr', String(pageNum));
+
+    if (Object.keys(options).length > 0) {
+      // Detailed search mode
+      params.set('details', 'on');
+      params.set('Words', query);
+      if (options.caselaw) params.set('chkRspr', 'on');
+      if (options.pendingProceedings) params.set('ChkAnhVerf', 'on');
+      if (options.dateRange) params.set('TxtDatum', options.dateRange);
+      if (options.norm) params.set('TxtNorm', options.norm);
+      if (options.court) params.set('TxtGericht', options.court);
+      if (options.journal) params.set('TxtZeitsFundst', options.journal);
+    } else {
+      params.set('words', query);
+      params.set('st', '');
+      params.set('searchid', '');
+    }
+
+    const searchUrl = `https://beck-online.beck.de/Search?${params.toString()}`;
     const res = await this.client.request(searchUrl);
     const html = await res.text();
     const $ = cheerio.load(html);
@@ -187,41 +207,54 @@ export class BeckClient {
     const results: SearchResult[] = [];
     const seenVpaths = new Set<string>();
 
-    $('a').each((_, el) => {
-      const $link = $(el);
-      const href = $link.attr('href') || '';
-      if (!href.includes('vpath=') && !href.includes('vpath%3D')) return;
+    // Parse structured result list: div#trefferliste ul li
+    $('#trefferliste ul li').each((_, li) => {
+      const $li = $(li);
 
-      let vpath = '';
+      // Title link: h2.sndline a.sndline or p.sndline a.sndline
+      const $titleLink = $li.find('h2.sndline a.sndline, p.sndline a.sndline').first();
+      const href = $titleLink.attr('href') || '';
+
       const match = href.match(/[?&]vpath=([^&]+)/) || href.match(/vpath%3D([^&]+)/);
-      if (match) {
-        vpath = decodeURIComponent(match[1]);
-      }
+      if (!match) return;
 
+      const vpath = decodeURIComponent(match[1]);
       if (!vpath || seenVpaths.has(vpath)) return;
       seenVpaths.add(vpath);
 
-      const title = $link.text().trim() || 'Untitled Document';
-      
-      // Attempt to extract snippet from parent container
-      let parent = $link.parent();
-      let snippet = '';
-      for (let i = 0; i < 3; i++) {
-        if (parent.length > 0 && (parent.hasClass('hit') || parent.hasClass('treffer') || parent.hasClass('bo-treffer') || parent.prop('tagName') === 'LI' || parent.prop('tagName') === 'DIV')) {
-          snippet = parent.text().replace(title, '').trim();
-          snippet = snippet.replace(/\s+/g, ' ').substring(0, 300);
-          break;
-        }
-        parent = parent.parent();
-      }
+      const title = $titleLink.text().trim() || $li.find('.treffer-firstline-text').text().trim() || 'Untitled Document';
+
+      // Snippet: p.textausschnitt
+      const snippet = $li.find('p.textausschnitt').text().replace(/\s+/g, ' ').trim().substring(0, 400);
 
       results.push({
         title,
         snippet,
         vpath,
-        url: `https://beck-online.beck.de/?vpath=${encodeURIComponent(vpath)}`
+        url: `https://beck-online.beck.de/Dokument?vpath=${encodeURIComponent(vpath)}`
       });
     });
+
+    // Fallback: scan all vpath links if structured list yielded nothing
+    if (results.length === 0) {
+      $('a').each((_, el) => {
+        const $link = $(el);
+        const href = $link.attr('href') || '';
+        if (!href.includes('vpath=') && !href.includes('vpath%3D')) return;
+
+        const match = href.match(/[?&]vpath=([^&]+)/) || href.match(/vpath%3D([^&]+)/);
+        if (!match) return;
+
+        const vpath = decodeURIComponent(match[1]);
+        if (!vpath || seenVpaths.has(vpath)) return;
+        seenVpaths.add(vpath);
+
+        const title = $link.text().trim() || 'Untitled Document';
+        const snippet = $link.closest('li, div.treffer-wrapper').find('p.textausschnitt').text().replace(/\s+/g, ' ').trim().substring(0, 400);
+
+        results.push({ title, snippet, vpath, url: `https://beck-online.beck.de/Dokument?vpath=${encodeURIComponent(vpath)}` });
+      });
+    }
 
     return results;
   }
